@@ -1,332 +1,162 @@
 """
-PPO Training Script for Qwen 4B on POLARIS-Dataset-53K
-Uses TRL library from Hugging Face
+PPO Training Script for Qwen 4B on POLARIS Dataset
+
+This script trains a Qwen 4B model using the Proximal Policy Optimization (PPO)
+algorithm from TRL library on the POLARIS-Project/Polaris-Dataset-53K dataset.
 """
 
-import os
 import torch
 from datasets import load_dataset
-from transformers import (
-    AutoTokenizer,
-    AutoModelForCausalLM,
-    AutoModelForSequenceClassification,
-    TrainingArguments,
-)
-from trl import PPOTrainer, PPOConfig, AutoModelForCausalLMWithValueHead
-from peft import LoraConfig, get_peft_model
-from typing import List, Dict
-import numpy as np
+from tqdm import tqdm
+from transformers import AutoTokenizer
+from trl import PPOTrainer, PPOConfig, AutoModelForCausalLMWithValueHead, create_reference_model
+import wandb
+import os
 
 
-class PPOTrainerWrapper:
-    """Wrapper for PPO training with Qwen 4B model"""
+def compute_reward(response_text):
+    """
+    Simple reward function for PPO training.
     
-    def __init__(self, config: PPOConfig, model_name: str = "Qwen/Qwen2.5-1.5B"):
-        """
-        Initialize PPO trainer
+    Args:
+        response_text: Generated response
         
-        Args:
-            config: PPO configuration
-            model_name: Model identifier from Hugging Face Hub
-        """
-        self.config = config
-        self.model_name = model_name
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
-        # Load tokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            model_name,
-            trust_remote_code=True,
-            padding_side="left"
-        )
-        self.tokenizer.pad_token = self.tokenizer.eos_token
-        
-        # Load base model with value head
-        self.model = AutoModelForCausalLMWithValueHead.from_pretrained(
-            model_name,
-            trust_remote_code=True,
-            torch_dtype=torch.float16,
-            device_map="auto"
-        )
-        
-        # Apply LoRA for parameter-efficient training
-        self._apply_lora()
-        
-        # Load dataset
-        self.dataset = self._load_dataset()
-        
-        # Initialize PPO trainer
-        self.ppo_trainer = None
-        
-    def _apply_lora(self):
-        """Apply LoRA adapters for efficient training"""
-        lora_config = LoraConfig(
-            r=16,
-            lora_alpha=32,
-            target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-            lora_dropout=0.05,
-            bias="none",
-            task_type="CAUSAL_LM"
-        )
-        self.model = get_peft_model(self.model, lora_config)
-        print(f"Trainable parameters: {self.model.get_nb_trainable_parameters()}")
+    Returns:
+        float: Reward value
+    """
+    # Simple reward based on length (encourage meaningful responses)
+    # Normalize to [0, 1] roughly
+    return min(len(response_text.split()) / 100.0, 1.0)
+
+
+def build_dataset(config, dataset_name="POLARIS-Project/Polaris-Dataset-53K"):
+    """
+    Load and preprocess the dataset for PPO.
+    """
+    tokenizer = AutoTokenizer.from_pretrained(config.model_name, trust_remote_code=True)
+    tokenizer.pad_token = tokenizer.eos_token
+    # Set padding side to left for generation
+    tokenizer.padding_side = "left"
     
-    def _load_dataset(self):
-        """Load and preprocess POLARIS dataset"""
-        print("Loading POLARIS-Project/Polaris-Dataset-53K dataset...")
-        dataset = load_dataset("POLARIS-Project/Polaris-Dataset-53K", split="train")
-        
-        # Filter to a smaller subset for faster training if needed
-        if len(dataset) > self.config.total_ppo_epochs * self.config.batch_size:
-            dataset = dataset.select(range(min(len(dataset), self.config.batch_size * 100)))
-        
-        print(f"Loaded {len(dataset)} examples from dataset")
-        return dataset
+    ds = load_dataset(dataset_name, split="train")
     
-    def _collator(self, data: List[Dict]):
-        """Collate function for batch processing"""
-        return {key: [d[key] for d in data] for key in data[0]}
-    
-    def _compute_reward(self, prompts: List[str], outputs: List[str], **kwargs) -> List[float]:
-        """
-        Compute reward for generated outputs
-        This is a simple reward function - replace with your own or load a reward model
-        
-        Args:
-            prompts: Input prompts
-            outputs: Generated outputs
-            
-        Returns:
-            List of reward values
-        """
-        rewards = []
-        for prompt, output in zip(prompts, outputs):
-            # Simple heuristic rewards (replace with actual reward model)
-            reward = 0.0
-            
-            # Reward based on output length
-            reward += min(len(output.split()) * 0.01, 1.0)
-            
-            # Reward for having some content
-            if len(output.strip()) > 0:
-                reward += 0.5
-            
-            # Reward for reasonable length
-            if 10 <= len(output.split()) <= 500:
-                reward += 0.5
-            
-            rewards.append(reward)
-        
-        return rewards
-    
-    def generate_query_responses(self, batch: Dict) -> Dict[str, List]:
-        """
-        Generate queries and responses from batch
-        
-        Args:
-            batch: Batch of examples
-            
-        Returns:
-            Dictionary with queries and responses
-        """
-        queries = []
-        responses = []
-        
-        for example in batch:
-            # Adapt based on actual dataset structure
-            if "instruction" in example:
-                query = example["instruction"]
-            elif "prompt" in example:
-                query = example["prompt"]
-            elif "input" in example:
-                query = example["input"]
-            else:
-                # Fallback: use first text field
-                for key, value in example.items():
-                    if isinstance(value, str):
-                        query = value
-                        break
-                else:
-                    query = "Please provide a helpful response."
-            
-            queries.append(query)
-        
-        # Generate responses using the model
-        inputs = self.tokenizer(
-            queries,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=512
-        ).to(self.device)
-        
-        with torch.no_grad():
-            outputs = self.model.generate(
-                **inputs,
-                max_length=256,
-                min_length=20,
-                do_sample=True,
-                temperature=0.7,
-                top_p=0.9,
-                pad_token_id=self.tokenizer.pad_token_id,
-                eos_token_id=self.tokenizer.eos_token_id
-            )
-        
-        # Decode responses
-        for i, output in enumerate(outputs):
-            # Remove the input prompt from the output
-            response = self.tokenizer.decode(
-                output[inputs["input_ids"].shape[1]:],
-                skip_special_tokens=True
-            )
-            responses.append(response)
-        
-        return {"query": queries, "response": responses}
-    
-    def train(self):
-        """Main training loop"""
-        print("Initializing PPO trainer...")
-        
-        # Initialize PPO trainer
-        self.ppo_trainer = PPOTrainer(
-            config=self.config,
-            model=self.model,
-            ref_model=None,  # Will use the same model as reference
-            tokenizer=self.tokenizer,
-            dataset=self.dataset,
-            data_collator=self._collator
-        )
-        
-        print("Starting PPO training...")
-        
-        generation_kwargs = {
-            "min_length": -1,
-            "top_k": 0.0,
-            "top_p": 1.0,
-            "do_sample": True,
-            "pad_token_id": self.tokenizer.pad_token_id,
-            "max_new_tokens": 256,
-        }
-        
-        # Training loop
-        for epoch, batch in enumerate(self.ppo_trainer.dataloader):
-            if epoch >= self.config.total_ppo_epochs:
-                break
-            
-            query_tensors = []
-            response_tensors = []
-            
-            # Prepare batch
-            print(f"\nEpoch {epoch + 1}/{self.config.total_ppo_epochs}")
-            
-            # Tokenize queries
-            for example in batch:
-                if "instruction" in example:
-                    query = example["instruction"]
-                elif "prompt" in example:
-                    query = example["prompt"]
-                elif "input" in example:
-                    query = example["input"]
-                else:
-                    query = str(list(example.values())[0])
-                
-                query_tensor = self.tokenizer.encode(
-                    query,
-                    return_tensors="pt",
-                    truncation=True,
-                    max_length=512
-                ).squeeze(0)
-                query_tensors.append(query_tensor)
-            
-            # Pad query tensors to same length
-            query_tensors = torch.nn.utils.rnn.pad_sequence(
-                [qt.to(self.device) for qt in query_tensors],
-                batch_first=True,
-                padding_value=self.tokenizer.pad_token_id
-            )
-            
-            # Generate responses
-            response_tensors = self.ppo_trainer.generate(
-                query_tensors,
-                **generation_kwargs
-            )
-            
-            # Decode responses for reward computation
-            batch["response"] = [
-                self.tokenizer.decode(rt.squeeze(), skip_special_tokens=True)
-                for rt in response_tensors
-            ]
-            
-            # Compute rewards
-            rewards = self._compute_reward(
-                prompts=[str(b.get("instruction", b.get("prompt", ""))) for b in batch],
-                outputs=batch["response"]
-            )
-            
-            # Convert to tensors
-            rewards = [torch.tensor(r).to(self.device) for r in rewards]
-            
-            # Run PPO step
-            stats = self.ppo_trainer.step(
-                query_tensors,
-                response_tensors,
-                rewards
-            )
-            
-            # Print statistics
-            print(f"Average reward: {torch.stack(rewards).mean().item():.4f}")
-            print(f"PPO stats: {stats}")
-            
-            # Save checkpoint periodically
-            if (epoch + 1) % 5 == 0:
-                self.save_checkpoint(f"checkpoint_epoch_{epoch + 1}")
-    
-    def save_checkpoint(self, output_dir: str):
-        """Save model checkpoint"""
-        print(f"Saving checkpoint to {output_dir}...")
-        self.model.save_pretrained(output_dir)
-        self.tokenizer.save_pretrained(output_dir)
-        print("Checkpoint saved!")
+    def tokenize(sample):
+        # Format prompt
+        prompt = f"User: {sample.get('input', sample.get('question', ''))}\nAssistant: "
+        sample["input_ids"] = tokenizer.encode(prompt)
+        sample["query"] = prompt
+        return sample
+
+    ds = ds.map(tokenize, batched=False)
+    ds.set_format(type="torch")
+    return ds, tokenizer
+
+
+def collator(data):
+    """
+    Custom collator to handle dictionary of lists.
+    """
+    return dict((key, [d[key] for d in data]) for key in data[0])
 
 
 def main():
-    """Main function to run PPO training"""
-    
-    # PPO Configuration
-    ppo_config = PPOConfig(
-        model_name="Qwen/Qwen2.5-1.5B",  # Using smaller model for efficiency
+    # Configuration
+    config = PPOConfig(
+        model_name="Qwen/Qwen2.5-3B-Instruct",
         learning_rate=1.41e-5,
-        batch_size=4,  # Small batch size for memory efficiency
-        mini_batch_size=4,
+        batch_size=1,  # Small batch size for memory efficiency
+        mini_batch_size=1,
         gradient_accumulation_steps=1,
-        total_ppo_epochs=20,
-        ppo_epochs=4,
-        max_grad_norm=1.0,
         optimize_cuda_cache=True,
         early_stopping=False,
-        target_kl=6.0,
-        init_kl_coef=0.2,
-        adap_kl_ctrl=True,
-        log_with="wandb",  # Set to None to disable wandb
-        project_name="qwen-ppo-polaris",
-        tracker_kwargs={
-            "wandb": {"entity": "your-entity", "project": "qwen-ppo-polaris"}
-        }
+        target_kl=0.1,
+        ppo_epochs=4,
+        seed=42,
+        log_with="wandb",
+        tracker_project_name="qwen-ppo-polaris",
     )
-    
-    # Initialize trainer
-    trainer = PPOTrainerWrapper(
-        config=ppo_config,
-        model_name="Qwen/Qwen2.5-1.5B"  # Or "Qwen/Qwen2.5-4B" if you have enough memory
+
+    # Initialize wandb
+    wandb.init(project="qwen-ppo-polaris")
+
+    # Load dataset and tokenizer
+    dataset, tokenizer = build_dataset(config)
+
+    # Load model with value head
+    # Note: Qwen models require trust_remote_code=True
+    print(f"Loading model: {config.model_name}")
+    model = AutoModelForCausalLMWithValueHead.from_pretrained(
+        config.model_name,
+        trust_remote_code=True,
+        torch_dtype=torch.float16,
+        device_map="auto",
+        # load_in_8bit=True,  # Uncomment if memory is tight
     )
+
+    # Create reference model
+    print("Creating reference model...")
+    ref_model = create_reference_model(model)
+
+    # Initialize PPO Trainer
+    ppo_trainer = PPOTrainer(
+        config,
+        model,
+        ref_model,
+        tokenizer,
+        dataset=dataset,
+        data_collator=collator,
+    )
+
+    # Generation settings
+    generation_kwargs = {
+        "min_length": -1,
+        "top_k": 0.0,
+        "top_p": 1.0,
+        "do_sample": True,
+        "pad_token_id": tokenizer.eos_token_id,
+        "max_new_tokens": 256,
+    }
+
+    # Training loop
+    print("Starting PPO training...")
+    output_dir = "./output/qwen-ppo-polaris"
+    os.makedirs(output_dir, exist_ok=True)
     
-    # Train
-    trainer.train()
-    
-    # Save final model
-    trainer.save_checkpoint("qwen_ppo_polaris_final")
-    
+    save_steps = 500
+    total_steps = 0
+
+    # Iterate over the dataset
+    # Note: In a real scenario, you might want to limit the number of steps
+    for epoch, batch in tqdm(enumerate(ppo_trainer.dataloader)):
+        query_tensors = batch["input_ids"]
+
+        # 1. Generate response
+        response_tensors = ppo_trainer.generate(
+            query_tensors, return_prompt=False, **generation_kwargs
+        )
+        
+        batch["response"] = tokenizer.batch_decode(response_tensors)
+
+        # 2. Compute rewards
+        rewards = [torch.tensor(compute_reward(r)) for r in batch["response"]]
+
+        # 3. Run PPO step
+        stats = ppo_trainer.step(query_tensors, response_tensors, rewards)
+        
+        # Log stats
+        ppo_trainer.log_stats(stats, batch, rewards)
+        
+        total_steps += 1
+        
+        # Save model periodically
+        if total_steps % save_steps == 0:
+            print(f"Saving model at step {total_steps}...")
+            ppo_trainer.save_pretrained(output_dir)
+            tokenizer.save_pretrained(output_dir)
+
     print("Training completed!")
+    ppo_trainer.save_pretrained(output_dir)
+    tokenizer.save_pretrained(output_dir)
 
 
 if __name__ == "__main__":
